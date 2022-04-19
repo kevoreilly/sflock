@@ -1,11 +1,22 @@
 # Copyright (C) 2017-2018 Jurriaan Bremer.
 # This file is part of SFlock - http://www.sflock.org/.
 # See the file 'docs/LICENSE.txt' for copying permission.
-
+import os
 import re
 from collections import OrderedDict
 
+import pefile
 from sflock.aux.decode_vbe_jse import DecodeVBEJSE
+"""
+try:
+    import yara
+    cur_dir = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(cur_dir, "data", "yara", "shellcodes.yar"), "rb") as f:
+        shellcode_rules = yara.compile(sources=f.read())
+    HAVE_YARA = True
+except ImportError:
+    HAVE_YARA = False
+"""
 
 try:
     from unicorn import Uc, UC_MODE_32, UC_MODE_64, UC_ARCH_X86, UC_HOOK_CODE, unicorn
@@ -14,11 +25,15 @@ try:
 except ImportError:
     HAVE_UNICORN = False
 
+shellcode_code_base = 0x100000
+shellcode_threshold = 0x100
+shellcode_limit = 0x100000
+
 file_extensions = OrderedDict(
     [
         ("msi", (b".msi", b".msp", b".appx")),
         ("pub", (b".pub",)),
-        ("doc", (b".doc", b".dot", b".docx", b".dotx", b".docm", b".dotm", b".docb", b".rtf", b".mht", b".mso", b".wbk")),
+        ("doc", (b".doc", b".dot", b".docx", b".dotx", b".docm", b".dotm", b".docb", b".rtf", b".mht", b".mso", b".wbk", b".wiz")),
         ("xls", (b".xls", b".xlt", b".xlm", b".xlsx", b".xltx", b".xlsm", b".xltm", b".xlsb", b".xla", b".xlam", b".xll", b".xlw", b".slk", b".xll", b".csv")),
         ("ppt", (b".ppt", b".ppa", b".pot", b".pps", b".pptx", b".pptm", b".potx", b".potm", b".ppam", b".ppsx", b".ppsm", b".sldx", b".sldm")),
         ("jar", (b".jar",)),
@@ -27,7 +42,7 @@ file_extensions = OrderedDict(
         ("swf", (b".swf", b".fws")),
         ("python", (b".py", b".pyc", b".pyw")),
         ("ps1", (b".ps1",)),
-        # ("msg", (b".msg",)),
+        # ("msg", (b".msg",, b".rpmsg")),
         # ("eml", (b".eml", b".ics")),
         ("js", (b".js", b".jse")),
         ("ie", (b".html", b".url")), # b".htm",
@@ -73,8 +88,10 @@ magics = OrderedDict(
         ("ACE archive data", "ace"),
         ("PE32 executable (DLL)", "dll"),
         ("PE32+ executable (DLL)", "dll"),
+        ("MS-DOS executable PE32 executable (DLL)", "dll"),
         ("PE32 executable", "exe"),
         ("PE32+ executable", "exe"),
+        ('MS-DOS executable, MZ for MS-DOS', "exe"),
         ("Microsoft PowerPoint", "ppt"),
         ("Microsoft Office Excel", "xls"),
         ("Microsoft Excel", "xls"),
@@ -99,16 +116,30 @@ magics = OrderedDict(
         ("MS Windows HtmlHelp Data", "chm"),
         ("Hangul (Korean) Word Processor File", "hwp"),
         ("XSL stylesheet", "xslt"),
+        # ("RFC 822 mail", "eml"),
+        # ("old news", "eml"),
+        # ("mail forwarding", "eml"),
+        # ("smtp mail", "eml"),
+        # ("news", "eml"),
+        # ("news or mail", "eml"),
+        # ("saved news", "eml"),
+        # ("MIME entity", "eml"),
+        # ("rpmsg Restricted Permission Message", "msg"),
+        ("Java Jar archive", "jar"),
+        ("META-INF/MANIFEST.MF", "jar"),
+        ("Java Jar file data (zip)", "jar"),
+        ("Java archive data (JAR)", "jar"),
         # ("HTML", "html"),
     ]
 )
 
-shellcode_code_base = 0x100000
-shellcode_threshold = 0x100
-shellcode_limit = 0x100000
-
-
 def detect_shellcode(f):
+    """
+    if HAVE_YARA:
+        matches = shellcode_rules.match(data=f.contents)
+        if matches:
+            return "Shellcode"
+    """
     global shellcode_count32, shellcode_count64, shellcode_last_address
     shellcode_count32 = 0
     shellcode_count64 = 0
@@ -163,6 +194,9 @@ def sct(f):
             return "hta"
 
 def xxe(f):
+    if f.contents.startswith(b"MZ"):
+        return None
+
     STRINGS = [
         b"XXEncode",
         b"begin",
@@ -178,6 +212,9 @@ def xxe(f):
 
 
 def hta(f):
+    if f.contents.startswith(b"MZ"):
+        return None
+
     STRINGS = [
         b"<head",
         b"<title",
@@ -207,6 +244,9 @@ def hta(f):
 
 
 def office_webarchive(f):
+    if f.contents.startswith(b"MZ"):
+        return None
+
     STRINGS = [
         b"<o:Pages>",
         b"<o:DocumentProperties>",
@@ -333,12 +373,18 @@ def javascript(f):
 
 
 def wsf(f):
+    if f.contents.startswith(b"MZ"):
+        return None
+
     match = re.search(b'<script\\s+language="(J|VB|Perl)Script"', f.contents, re.I)
     if match:
         return "wsf"
 
 
 def pub(f):
+    if f.contents.startswith(b"MZ"):
+        return None
+
     PUB_STRS = [
         b"Microsoft Publisher",
         b"MSPublisher",
@@ -403,6 +449,9 @@ def dmg(f):
 
 
 def vbe_jse(f):
+    if f.contents.startswith(b"MZ"):
+        return None
+
     if b"#@~^" in f.contents[:100]:
         data = DecodeVBEJSE(f.contents, "")
         if data:
@@ -428,6 +477,13 @@ def identify(f):
             return package
     for magic_types in magics:
         if f.magic.startswith(magic_types):
+            # MS-DOS executable PE32 executable (DLL) (GUI) Intel 80386, for MS Windows
+            #   MZ for MS-DOS -> MS-DOS executable
+            #       MZ for MS-DOS -> but is DLL
+            package = magics[magic_types]
+            if package in ("exe", "dll"):
+                pe = pefile.PE(data=f.contents, fast_load=True)
+                return "dll" if pe.is_dll() else "exe"
             return magics[magic_types]
     if f.mime in mimes:
         return mimes[f.mime]
